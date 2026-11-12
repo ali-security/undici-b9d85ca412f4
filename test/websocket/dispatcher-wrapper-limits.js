@@ -1,9 +1,9 @@
 'use strict'
 
-// WebSocket reads its receive limit (maxPayloadSize) from the dispatcher's
-// `webSocketOptions`. Wrappers such as RetryAgent and MockAgent must report
-// the wrapped agent's limit, and a dispatcher that doesn't provide any must
-// get the default limit, not none.
+// WebSocket reads its receive limits (maxPayloadSize, maxFragments) from the
+// dispatcher's `webSocketOptions`. Wrappers such as RetryAgent and MockAgent
+// must report the wrapped agent's limits, and a dispatcher that doesn't
+// provide any must get the default limits, not none.
 //
 // Each test waits for the close code the server observes, so nothing depends
 // on timing. If a message gets through instead, the client closes normally
@@ -21,7 +21,7 @@ const {
   WebSocket
 } = require('../..')
 
-const webSocket = { maxPayloadSize: 1024 }
+const webSocket = { maxPayloadSize: 1024, maxFragments: 8 }
 
 const wrappers = {
   RetryAgent: (opts) => new RetryAgent(new Agent(opts)),
@@ -78,6 +78,15 @@ function sendCompressed (size) {
   return (ws) => ws.send(Buffer.alloc(size, 0x41), { binary: true, compress: true })
 }
 
+function sendFragments (count) {
+  return (ws) => {
+    const fragment = Buffer.from('a')
+    for (let i = 0; i < count; i++) {
+      ws.send(fragment, { binary: true, compress: false, fin: i === count - 1 })
+    }
+  }
+}
+
 // One compressed frame that inflates to just over the 128 MB default, while
 // only about 128 KB goes over the wire (a decompression bomb).
 function sendDecompressionBomb (ws) {
@@ -129,7 +138,41 @@ for (const [name, wrap] of Object.entries(wrappers)) {
     assert.strictEqual(await connect(t, server.url, dispatcher), 512)
     assert.strictEqual((await server.closed).code, 1005)
   })
+
+  test(`${name} applies the wrapped agent's maxFragments`, async (t) => {
+    const dispatcher = wrap({ webSocket })
+    t.after(() => dispatcher.close())
+    const server = await startServer(t, sendFragments(20))
+
+    connect(t, server.url, dispatcher)
+    assert.deepStrictEqual(await server.closed, { code: 1008, reason: 'Too many message fragments' })
+  })
+
+  test(`${name} delivers fragmented messages within the wrapped agent's maxFragments`, async (t) => {
+    const dispatcher = wrap({ webSocket })
+    t.after(() => dispatcher.close())
+    const server = await startServer(t, sendFragments(8))
+
+    assert.strictEqual(await connect(t, server.url, dispatcher), 8)
+    assert.strictEqual((await server.closed).code, 1005)
+  })
 }
+
+test('Agent reports the default maxFragments when none is configured', async (t) => {
+  const agent = new Agent()
+  t.after(() => agent.close())
+
+  assert.strictEqual(agent.webSocketOptions.maxFragments, 131072)
+  assert.strictEqual(new RetryAgent(agent).webSocketOptions.maxFragments, 131072)
+})
+
+test('a dispatcher without webSocketOptions gets the default maxFragments', async (t) => {
+  // One more than the default of 131072.
+  const server = await startServer(t, sendFragments(131073))
+
+  connect(t, server.url, customDispatcher(t))
+  assert.deepStrictEqual(await server.closed, { code: 1008, reason: 'Too many message fragments' })
+})
 
 test('a dispatcher without webSocketOptions gets the default maxPayloadSize for decompression', async (t) => {
   const server = await startServer(t, sendDecompressionBomb)
@@ -147,5 +190,16 @@ test('an explicit 0 still disables the limit through a wrapper', async (t) => {
   const server = await startServer(t, sendDecompressionBomb)
 
   assert.strictEqual(await connect(t, server.url, dispatcher), 129 * 1024 * 1024)
+  assert.strictEqual((await server.closed).code, 1005)
+})
+
+test('an explicit maxFragments of 0 still disables the limit through a wrapper', async (t) => {
+  const dispatcher = new RetryAgent(new Agent({ webSocket: { maxFragments: 0 } }))
+  t.after(() => dispatcher.close())
+  // More fragments than the default limit, so a 0 replaced by the default
+  // would fail this.
+  const server = await startServer(t, sendFragments(131073))
+
+  assert.strictEqual(await connect(t, server.url, dispatcher), 131073)
   assert.strictEqual((await server.closed).code, 1005)
 })

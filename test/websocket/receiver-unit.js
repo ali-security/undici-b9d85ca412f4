@@ -119,15 +119,19 @@ async function raceTimeout (promise, ms) {
   }
 }
 
-function assertFailedWith1009 (calls, reason) {
+function assertFailedWithCode (calls, code, reason) {
   assert.strictEqual(calls.messages.length, 0, 'no message must be dispatched')
   assert.strictEqual(calls.written.length, 1, 'a close frame must be sent')
   const close = decodeCloseFrame(calls.written[0])
-  assert.strictEqual(close.code, 1009)
+  assert.strictEqual(close.code, code)
   assert.strictEqual(close.reason, reason)
   assert.strictEqual(calls.abort, 1)
   assert.strictEqual(calls.destroy, 1, 'the socket must be destroyed')
   assert.deepStrictEqual(calls.errors, [reason])
+}
+
+function assertFailedWith1009 (calls, reason) {
+  assertFailedWithCode(calls, 1009, reason)
 }
 
 test('ByteParser rejects 64-bit payload lengths with a non-zero upper word', (t) => {
@@ -202,7 +206,113 @@ test('ByteParser rejects fragmented uncompressed messages whose total size excee
 
   await new Promise((resolve) => setImmediate(resolve))
 
-  assertFailedWith1009(calls, new MessageSizeExceededError().message)
+  // The third frame announces a length that, added to the 1024 bytes already
+  // buffered, exceeds the limit, so it is rejected before its body is read.
+  assertFailedWith1009(calls, 'Payload size exceeds maximum allowed size')
+  parser.destroy()
+})
+
+test('ByteParser rejects a continuation frame announcing more than the remaining maxPayloadSize before buffering it', async (t) => {
+  const { ws, calls } = createOpenWebSocket()
+  const parser = new ByteParser(ws, null, { maxPayloadSize: 1024 })
+
+  // The first fragment fills the whole budget without exceeding it.
+  parser.write(createFrame({ fin: false, opcode: 0x2, payload: Buffer.alloc(1024, 0x41) }))
+  // Only the header of the next fragment is sent: the parser must fail the
+  // connection without waiting for its body while holding the first fragment.
+  parser.write(createFrameHeader({ fin: true, opcode: 0x0, length: 1024 }))
+
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assertFailedWith1009(calls, 'Payload size exceeds maximum allowed size')
+  parser.destroy()
+})
+
+test('ByteParser fails the connection with 1008 when a message has more than maxFragments fragments', async (t) => {
+  // Zero-length fragments must be counted too, otherwise a peer can grow the
+  // fragment list without bound by flooding empty continuation frames.
+  for (const payload of [Buffer.from('a'), Buffer.alloc(0)]) {
+    for (const opcode of [0x1, 0x2]) {
+      const { ws, calls } = createOpenWebSocket()
+      const parser = new ByteParser(ws, null, { maxFragments: 3 })
+
+      parser.write(createFrame({ fin: false, opcode, payload }))
+      parser.write(createFrame({ fin: false, opcode: 0x0, payload }))
+      parser.write(createFrame({ fin: false, opcode: 0x0, payload }))
+      parser.write(createFrame({ fin: false, opcode: 0x0, payload }))
+
+      await new Promise((resolve) => setImmediate(resolve))
+
+      assertFailedWithCode(calls, 1008, 'Too many message fragments')
+      assert.strictEqual(ws[kReadyState], states.CLOSING)
+      parser.destroy()
+    }
+  }
+})
+
+test('ByteParser fails the connection with 1008 when a compressed message has more than maxFragments fragments', async (t) => {
+  const { ws, calls } = createOpenWebSocket()
+  const extensions = new Map([['permessage-deflate', '']])
+  const parser = new ByteParser(ws, extensions, { maxFragments: 3 })
+
+  const fragment = deflateRawSync(Buffer.from('a'), { finishFlush: Z_SYNC_FLUSH })
+
+  const errored = once(ws, 'error')
+  parser.write(createFrame({ fin: false, rsv1: true, opcode: 0x2, payload: fragment }))
+  for (let i = 0; i < 3; i++) {
+    parser.write(createFrame({ fin: false, opcode: 0x0, payload: fragment }))
+  }
+
+  const result = await raceTimeout(errored, 5000)
+  assert.ok(result, 'the connection must be failed')
+
+  assertFailedWithCode(calls, 1008, 'Too many message fragments')
+  parser.destroy()
+})
+
+test('ByteParser delivers a message made of exactly maxFragments fragments', async (t) => {
+  const { ws, calls } = createOpenWebSocket()
+  const parser = new ByteParser(ws, null, { maxFragments: 3 })
+
+  // An empty first fragment is valid and must not break the message.
+  parser.write(createFrame({ fin: false, opcode: 0x2, payload: Buffer.alloc(0) }))
+  parser.write(createFrame({ fin: false, opcode: 0x0, payload: Buffer.from('ab') }))
+  parser.write(createFrame({ fin: true, opcode: 0x0, payload: Buffer.from('c') }))
+
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.strictEqual(calls.messages.length, 1)
+  assert.deepStrictEqual(Buffer.from(calls.messages[0]), Buffer.from('abc'))
+  assert.strictEqual(calls.written.length, 0)
+  assert.strictEqual(calls.destroy, 0)
+
+  // The fragment count is per message: the next message starts from zero.
+  parser.write(createFrame({ fin: false, opcode: 0x2, payload: Buffer.from('d') }))
+  parser.write(createFrame({ fin: false, opcode: 0x0, payload: Buffer.from('e') }))
+  parser.write(createFrame({ fin: true, opcode: 0x0, payload: Buffer.from('f') }))
+
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.strictEqual(calls.messages.length, 2)
+  assert.deepStrictEqual(Buffer.from(calls.messages[1]), Buffer.from('def'))
+  assert.strictEqual(calls.written.length, 0)
+  parser.destroy()
+})
+
+test('ByteParser does not limit the number of fragments when maxFragments is 0', async (t) => {
+  const { ws, calls } = createOpenWebSocket()
+  const parser = new ByteParser(ws, null, { maxFragments: 0 })
+
+  parser.write(createFrame({ fin: false, opcode: 0x2, payload: Buffer.from('a') }))
+  for (let i = 0; i < 99; i++) {
+    parser.write(createFrame({ fin: i === 98, opcode: 0x0, payload: Buffer.from('a') }))
+  }
+
+  await new Promise((resolve) => setImmediate(resolve))
+
+  assert.strictEqual(calls.messages.length, 1)
+  assert.strictEqual(calls.messages[0].byteLength, 100)
+  assert.strictEqual(calls.written.length, 0)
   parser.destroy()
 })
 
